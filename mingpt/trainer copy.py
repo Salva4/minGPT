@@ -11,27 +11,35 @@ from torch.utils.data.dataloader import DataLoader
 from mingpt.utils import CfgNode as CN
 
 class Trainer:
-    def __init__(
-            self, model, train_dataset, device, batch_size, num_workers, grad_norm_clip, 
-            max_iters, weight_decay, learning_rate, betas,
-    ):
+
+    @staticmethod
+    def get_default_config():
+        C = CN()
+        # device to train on
+        C.device = 'auto'
+        # dataloder parameters
+        C.num_workers = 4
+        # optimizer parameters
+        C.max_iters = None
+        C.batch_size = 64
+        C.learning_rate = 3e-4
+        C.betas = (0.9, 0.95)
+        C.weight_decay = 0.1 # only applied on matmul weights
+        C.grad_norm_clip = 1.0
+        return C
+
+    def __init__(self, config, model, train_dataset):
+        self.config = config
         self.model = model
         self.optimizer = None
         self.train_dataset = train_dataset
         self.callbacks = defaultdict(list)
-        self.batch_size = batch_size
-        self.num_workers = num_workers
-        self.grad_norm_clip = grad_norm_clip
-        self.max_iters = max_iters
-        self.weight_decay = weight_decay
-        self.learning_rate = learning_rate
-        self.betas = betas
 
         # determine the device we'll train on
-        if device == 'auto':
+        if config.device == 'auto':
             self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         else:
-            self.device = device
+            self.device = config.device
         self.model = self.model.to(self.device)
         print("running on device", self.device)
 
@@ -51,23 +59,19 @@ class Trainer:
             callback(self)
 
     def run(self):
-        model = self.model
+        model, config = self.model, self.config
 
         # setup the optimizer
-        self.optimizer = model.configure_optimizers(
-            self.weight_decay, self.learning_rate, self.betas
-        )
+        self.optimizer = model.configure_optimizers(config)
 
         # setup the dataloader
         train_loader = DataLoader(
             self.train_dataset,
-            sampler=torch.utils.data.RandomSampler(
-                self.train_dataset, replacement=True, num_samples=int(1e10)
-            ),
+            sampler=torch.utils.data.RandomSampler(self.train_dataset, replacement=True, num_samples=int(1e10)),
             shuffle=False,
             pin_memory=True,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
+            batch_size=config.batch_size,
+            num_workers=config.num_workers,
         )
 
         model.train()
@@ -91,7 +95,7 @@ class Trainer:
             # backprop and update the parameters
             model.zero_grad(set_to_none=True)
             self.loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), self.grad_norm_clip)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_norm_clip)
             self.optimizer.step()
 
             self.trigger_callbacks('on_batch_end')
@@ -101,5 +105,5 @@ class Trainer:
             self.iter_time = tnow
 
             # termination conditions
-            if self.max_iters is not None and self.iter_num >= self.max_iters:
+            if config.max_iters is not None and self.iter_num >= config.max_iters:
                 break
