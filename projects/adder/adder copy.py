@@ -2,36 +2,43 @@
 Trains a GPT to add n-digit numbers.
 """
 
+import os
+import sys
+import json
+
 import torch
 from torch.utils.data import Dataset
 from torch.utils.data.dataloader import DataLoader
 
 from mingpt.model import GPT
 from mingpt.trainer import Trainer
-from mingpt.utils import set_seed
+from mingpt.utils import set_seed, setup_logging, CfgNode as CN
 
-seed = 3407
+# -----------------------------------------------------------------------------
 
-## Data
-ndigit = 2
+def get_config():
 
-## Model
-d_model = 48
-nhead = 3
-num_layers = 3
-embd_pdrop = .1
-resid_pdrop = .1
-attn_pdrop = .1
+    C = CN()
 
-## Training
-device = 'cpu'
-num_workers = 4
-max_iters = None
-batch_size = 64
-learning_rate = 5e-4
-betas = [.9, .95]
-weight_decay = .1
-grad_norm_clip = 1.
+    # system
+    C.system = CN()
+    C.system.seed = 3407
+    C.system.work_dir = './out/adder'
+
+    # data
+    C.data = AdditionDataset.get_default_config()
+
+    # model
+    C.model = GPT.get_default_config()
+    C.model.model_type = 'gpt-nano'
+
+    # trainer
+    C.trainer = Trainer.get_default_config()
+    C.trainer.learning_rate = 5e-4 # the model we're using is so small that we can go a bit faster
+
+    return C
+
+# -----------------------------------------------------------------------------
 
 class AdditionDataset(Dataset):
     """
@@ -58,11 +65,18 @@ class AdditionDataset(Dataset):
     correctly.
     """
 
-    def __init__(self, ndigit, split):
-        self.ndigit = ndigit
+    @staticmethod
+    def get_default_config():
+        C = CN()
+        C.ndigit = 2
+        return C
+
+    def __init__(self, config, split):
+        self.config = config
         self.split = split # train/test
 
         # split up all addition problems into either training data or test data
+        ndigit = self.config.ndigit
         assert ndigit <= 3, "the lines below would be very memory inefficient, in future maybe refactor to support"
         num = (10**ndigit)**2 # total number of possible addition problems with ndigit numbers
         rng = torch.Generator()
@@ -78,13 +92,13 @@ class AdditionDataset(Dataset):
         # a,b,a+b, and +1 due to potential carry overflow,
         # but then also -1 because very last digit doesn't ever plug back
         # as there is no explicit <EOS> token to predict, it is implied
-        return 3*self.ndigit + 1 - 1
+        return 3*self.config.ndigit + 1 - 1
 
     def __len__(self):
         return self.ixes.nelement()
 
     def __getitem__(self, idx):
-        ndigit = self.ndigit
+        ndigit = self.config.ndigit
         # given a problem index idx, first recover the associated a + b
         idx = self.ixes[idx].item()
         nd = 10**ndigit
@@ -107,30 +121,30 @@ class AdditionDataset(Dataset):
 # -----------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    set_seed(seed)
+
+    # get default config and overrides from the command line, if any
+    config = get_config()
+    config.merge_from_args(sys.argv[1:])
+    print(config)
+    setup_logging(config)
+    set_seed(config.system.seed)
 
     # construct train and test datasets
-    train_dataset = AdditionDataset(ndigit, split='train')
-    test_dataset  = AdditionDataset(ndigit, split='test')
+    train_dataset = AdditionDataset(config.data, split='train')
+    test_dataset  = AdditionDataset(config.data, split='test')
 
     # construct the model
-    vocab_size = train_dataset.get_vocab_size()
-    block_size = train_dataset.get_block_size()
-
-    model = GPT(
-        vocab_size, block_size, d_model, nhead, num_layers, embd_pdrop, 
-        resid_pdrop, attn_pdrop,
-    )
+    config.model.vocab_size = train_dataset.get_vocab_size()
+    config.model.block_size = train_dataset.get_block_size()
+    model = GPT(config.model)
 
     # construct the trainer object
-    trainer = Trainer(
-        model, train_dataset, device, batch_size, num_workers, grad_norm_clip, 
-        max_iters, weight_decay, learning_rate, betas,
-    )
+    trainer = Trainer(config.trainer, model, train_dataset)
 
     # helper function for the evaluation of a model
     def eval_split(trainer, split, max_batches=None):
-        dataset = {'train': train_dataset, 'test': test_dataset}[split]
+        dataset = {'train':train_dataset, 'test':test_dataset}[split]
+        ndigit = config.data.ndigit
         results = []
         mistakes_printed_already = 0
         factors = torch.tensor([[10**i for i in range(ndigit+1)][::-1]]).to(trainer.device)
@@ -172,7 +186,7 @@ if __name__ == '__main__':
 
         if trainer.iter_num % 500 == 0:
             # evaluate both the train and test score
-            train_max_batches = {1: None, 2: None, 3: 5}[ndigit] # if ndigit=2 we can afford the whole train set, ow no
+            train_max_batches = {1: None, 2: None, 3: 5}[config.data.ndigit] # if ndigit=2 we can afford the whole train set, ow no
             model.eval()
             with torch.no_grad():
                 train_score = eval_split(trainer, 'train', max_batches=train_max_batches)
@@ -181,6 +195,9 @@ if __name__ == '__main__':
             # save the model if this is the best score we've seen so far
             if score > top_score:
                 top_score = score
+                print(f"saving model with new top score of {score}")
+                ckpt_path = os.path.join(config.system.work_dir, "model.pt")
+                torch.save(model.state_dict(), ckpt_path)
             # revert model to training mode
             model.train()
 

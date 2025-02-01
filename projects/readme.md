@@ -1,4 +1,4 @@
 
-### minGPT projects
+### adder
 
-Various projects that use the minGPT library to achieve great things.
+Train a GPT model to add n-digit numbers
